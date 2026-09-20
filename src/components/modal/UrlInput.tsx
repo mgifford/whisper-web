@@ -1,14 +1,17 @@
 import { DetailedHTMLProps, InputHTMLAttributes } from "react";
 
-export function UrlInput(
-  props: DetailedHTMLProps<
-    InputHTMLAttributes<HTMLInputElement>,
-    HTMLInputElement
-  >,
-) {
+export function UrlInput({
+  label = "URL of audio file",
+  ...props
+}: DetailedHTMLProps<
+  InputHTMLAttributes<HTMLInputElement>,
+  HTMLInputElement
+> & { label?: string }) {
   return (
     <div>
-      <label htmlFor='url-input' className='form-label'>URL of audio file</label>
+      <label htmlFor='url-input' className='form-label'>
+        {label}
+      </label>
       <input
         {...props}
         id='url-input'

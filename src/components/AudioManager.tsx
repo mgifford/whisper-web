@@ -17,6 +17,7 @@ import {
   FolderIcon,
   MicrophoneIcon,
   InfoIcon,
+  RssIcon,
   ThemeIcon,
   SettingsIcon,
 } from "../utils/Icons";
@@ -31,6 +32,7 @@ import {
 const SettingsModal = React.lazy(() => import("./SettingsModal"));
 const RecordModal = React.lazy(() => import("./RecordModal"));
 const UrlModal = React.lazy(() => import("./UrlModal"));
+const RssModal = React.lazy(() => import("./RssModal"));
 const INVALID_AUDIO_LINK = "INVALID_AUDIO_LINK";
 const INVALID_URL_SCHEME = "INVALID_URL_SCHEME";
 const INVALID_URL_FORMAT = "INVALID_URL_FORMAT";
@@ -572,7 +574,11 @@ export const AudioManager = React.memo(function AudioManager(props: {
   };
 
   const downloadAudioFromUrl = useCallback(
-    async (requestAbortController: AbortController, url: string) => {
+    async (
+      requestAbortController: AbortController,
+      url: string,
+      sourceName?: string,
+    ) => {
       try {
         setAudioData(undefined);
         setAudioError(null);
@@ -619,7 +625,7 @@ export const AudioManager = React.memo(function AudioManager(props: {
             buffer,
             mimeType,
             isSampleVideo,
-            getFileNameFromUrl(parsedUrl),
+            sourceName || getFileNameFromUrl(parsedUrl),
             isSampleAudio,
           );
           return;
@@ -657,7 +663,7 @@ export const AudioManager = React.memo(function AudioManager(props: {
           data,
           mimeType,
           isSampleVideo,
-          getFileNameFromUrl(parsedUrl),
+          sourceName || getFileNameFromUrl(parsedUrl),
           isSampleAudio,
         );
       } catch (error) {
@@ -706,14 +712,14 @@ export const AudioManager = React.memo(function AudioManager(props: {
   }, []);
 
   const handleUrlUpdate = useCallback(
-    (url: string) => {
+    (url: string, sourceName?: string) => {
       if (requestAbortControllerRef.current) {
         requestAbortControllerRef.current.abort();
       }
 
       const requestAbortController = new AbortController();
       requestAbortControllerRef.current = requestAbortController;
-      downloadAudioFromUrl(requestAbortController, url);
+      downloadAudioFromUrl(requestAbortController, url, sourceName);
     },
     [downloadAudioFromUrl],
   );
@@ -729,6 +735,12 @@ export const AudioManager = React.memo(function AudioManager(props: {
             <UrlTile
               icon={<AnchorIcon />}
               text='From URL'
+              onUrlUpdate={handleUrlUpdate}
+            />
+            <VerticalBar />
+            <RssTile
+              icon={<RssIcon />}
+              text='From RSS'
               onUrlUpdate={handleUrlUpdate}
             />
             <VerticalBar />
@@ -1308,6 +1320,46 @@ function UrlTile(props: {
       {showModal && (
         <React.Suspense fallback={null}>
           <UrlModal
+            show={showModal}
+            onSubmit={onSubmit}
+            onClose={onClose}
+          />
+        </React.Suspense>
+      )}
+    </>
+  );
+}
+
+function RssTile(props: {
+  icon: JSX.Element;
+  text: string;
+  onUrlUpdate: (url: string, title?: string) => void;
+}) {
+  const [showModal, setShowModal] = useState(false);
+
+  const onClick = () => {
+    setShowModal(true);
+  };
+
+  const onClose = () => {
+    setShowModal(false);
+  };
+
+  const onSubmit = (url: string, title?: string) => {
+    props.onUrlUpdate(url, title);
+    onClose();
+  };
+  return (
+    <>
+      <Tile
+        icon={props.icon}
+        text={props.text}
+        onClick={onClick}
+        isUploadButton
+      />
+      {showModal && (
+        <React.Suspense fallback={null}>
+          <RssModal
             show={showModal}
             onSubmit={onSubmit}
             onClose={onClose}

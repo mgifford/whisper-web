@@ -16,6 +16,24 @@ export function AnchorIcon() {
   );
 }
 
+export function RssIcon() {
+  return (
+    <svg
+      xmlns='http://www.w3.org/2000/svg'
+      fill='none'
+      viewBox='0 0 24 24'
+      strokeWidth='1.5'
+      stroke='currentColor'
+    >
+      <path
+        strokeLinecap='round'
+        strokeLinejoin='round'
+        d='M6.75 3.75v16.5M6.75 3.75A2.25 2.25 0 004.5 6m2.25-2.25A2.25 2.25 0 019 6m6.75-2.25v16.5M15 9.75a2.25 2.25 0 002.25 2.25M15 6a2.25 2.25 0 010 4.5m0 0h-1.5m-9 6.75a2.25 2.25 0 102.25 2.25m-2.25-2.25a2.25 2.25 0 01-2.25 2.25m12.75-2.25a2.25 2.25 0 112.25 2.25m-2.25-2.25a2.25 2.25 0 00-2.25 2.25m0 0h-2.25'
+      />
+    </svg>
+  );
+}
+
 export function FolderIcon() {
   return (
     <svg
