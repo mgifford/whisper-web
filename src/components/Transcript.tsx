@@ -21,6 +21,9 @@ import {
   useInteractions,
 } from "@floating-ui/react";
 import {
+  DiarizationData,
+  Speaker,
+  SpeakerCountMode,
   SummaryData,
   TranscriptChunk,
   TranscriberData,
@@ -42,8 +45,54 @@ import {
   replaceMatchesInChunk,
 } from "../utils/FindReplaceUtils";
 import { resolveLanguageAndDirection } from "../utils/LanguageUtils";
+import { WarningIcon } from "../utils/Icons";
 import { Spinner } from "./TranscribeButton";
 import FindReplacePanel from "./FindReplacePanel";
+import Modal from "./modal/Modal";
+
+// Splits a key-points summary into paragraphs and semantic bullet items,
+// stripping markdown-style "*"/"-" markers so lists render as real <ul><li>.
+// Consecutive bullet blocks (e.g. from separate chunks of a long transcript)
+// are merged into a single list instead of rendering as several adjacent <ul>s.
+function parseKeyPointBlocks(text: string): { bullets: string[]; text: string }[] {
+  const bulletPattern = /^\s*[*-]\s+(.*)$/;
+  const blocks = text.split(/\n{2,}/).map((block) => {
+    const lines = block.split("\n").filter((line) => line.trim().length > 0);
+    const bulletLines = lines
+      .map((line) => line.match(bulletPattern)?.[1])
+      .filter((line): line is string => line !== undefined);
+
+    if (bulletLines.length > 0 && bulletLines.length === lines.length) {
+      return { bullets: bulletLines, text: "" };
+    }
+    return { bullets: [], text: block };
+  });
+
+  return blocks.reduce<{ bullets: string[]; text: string }[]>((merged, block) => {
+    const previous = merged[merged.length - 1];
+    if (block.bullets.length > 0 && previous?.bullets.length) {
+      previous.bullets.push(...block.bullets);
+      return merged;
+    }
+    merged.push(block);
+    return merged;
+  }, []);
+}
+
+// Bolds a leading "Speaker Name: " attribution so it stands out from the rest of the line.
+const SPEAKER_PREFIX_PATTERN = /^([^:\n]{1,40}):\s+([\s\S]*)$/;
+function renderWithSpeakerPrefix(line: string) {
+  const match = line.match(SPEAKER_PREFIX_PATTERN);
+  if (!match) {
+    return line;
+  }
+  const [, speaker, rest] = match;
+  return (
+    <>
+      <strong>{speaker}:</strong> {rest}
+    </>
+  );
+}
 
 interface Props {
   transcribedData: TranscriberData | undefined;
@@ -68,6 +117,11 @@ interface Props {
   summary?: SummaryData;
   onGenerateSummary?: () => void;
   supportsSummarizer?: boolean;
+  diarization?: DiarizationData;
+  audioAvailable?: boolean;
+  onIdentifySpeakers?: (speakerCount: SpeakerCountMode) => void;
+  onAddSpeaker?: () => Speaker;
+  onRenameSpeaker?: (speakerId: string, name: string) => void;
   currentTime?: number;
   subscribeToTimeUpdate?: (subscriber: (time: number) => void) => () => void;
   isAutoScrollSettingEnabled?: boolean;
@@ -170,6 +224,7 @@ function EditableChunk(props: {
   onDeleteEmpty?: () => void;
   shouldFocus?: boolean;
   focusAtEnd?: boolean;
+  className?: string;
   highlightRanges?: { start: number; end: number; isActive: boolean }[];
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
@@ -275,7 +330,7 @@ function EditableChunk(props: {
       ref={editorRef}
       dir={props.dir}
       lang={props.lang}
-      className='flex-1 whitespace-pre-wrap rounded border border-dashed border-blue-300 bg-blue-50/60 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-solid dark:border-blue-400/50 dark:bg-blue-950/30'
+      className={`${props.className ?? ""} min-w-0 flex-1 whitespace-pre-wrap rounded border border-dashed border-blue-300 bg-blue-50/60 px-2 py-1 [overflow-wrap:anywhere] focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-solid dark:border-blue-400/50 dark:bg-blue-950/30`}
       contentEditable
       suppressContentEditableWarning
       role='textbox'
@@ -324,7 +379,7 @@ function EditableTimestamp(props: {
       dir='ltr'
       aria-label={props.label}
       inputMode='numeric'
-      className='me-5 self-stretch shrink-0 w-20 text-center tabular-nums focus:outline-none focus:ring-2 focus:ring-blue-500 rounded border border-dashed border-blue-300 bg-blue-50/60 px-1 py-1 dark:border-blue-400/50 dark:bg-blue-950/30'
+      className='me-1 self-stretch shrink-0 w-16 text-center tabular-nums focus:outline-none focus:ring-2 focus:ring-blue-500 rounded border border-dashed border-blue-300 bg-blue-50/60 px-1 py-1 dark:border-blue-400/50 dark:bg-blue-950/30 sm:me-5 sm:w-20'
       value={value}
       onChange={(e) => setValue(e.target.value)}
       onBlur={handleBlur}
@@ -358,7 +413,7 @@ function TimestampButton({
       ref={onMount}
       type='button'
       dir='ltr'
-      className='timestamp-pill me-5 shrink-0 text-left tabular-nums'
+      className='timestamp-pill me-1 shrink-0 text-left tabular-nums sm:me-5'
       onClick={onClick}
       onKeyDown={onKeyDown}
       tabIndex={tabIndex}
@@ -375,6 +430,7 @@ function TimestampButton({
 
 interface TranscriptSegmentProps {
   chunk: TranscriptChunk;
+  speakers?: Speaker[];
   index: number;
   isActive: boolean;
   isEditing: boolean;
@@ -403,10 +459,83 @@ interface TranscriptSegmentProps {
   onContainerMount: (element: HTMLDivElement | null, index: number) => void;
   onTimestampHover?: (element: HTMLElement | null) => void;
   highlightRanges?: { start: number; end: number; isActive: boolean }[];
+  isSpeakerDiarizationBusy: boolean;
+  onAddSpeaker?: () => Speaker;
+  onRequestSpeakerRename?: (speaker: Speaker) => void;
+}
+
+function RenameSpeakerButton(props: {
+  speakerLabel: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  const [isTooltipOpen, setIsTooltipOpen] = useState(false);
+  const arrowRef = useRef<SVGSVGElement>(null);
+  const { refs, floatingStyles, context } = useFloating({
+    open: isTooltipOpen,
+    onOpenChange: setIsTooltipOpen,
+    placement: "top",
+    middleware: [
+      offset(10),
+      flip(),
+      shift({ padding: 8 }),
+      // Floating UI reads this ref after render to calculate arrow placement.
+      // eslint-disable-next-line react-hooks/refs
+      arrow({ element: arrowRef }),
+    ],
+    whileElementsMounted: autoUpdate,
+  });
+  const hover = useHover(context, {
+    move: false,
+    delay: { open: 600, close: 0 },
+  });
+  const focus = useFocus(context);
+  const { getReferenceProps, getFloatingProps } = useInteractions([
+    hover,
+    focus,
+  ]);
+
+  return (
+    <>
+      <button
+        ref={refs.setReference}
+        type='button'
+        aria-label={`Rename ${props.speakerLabel}`}
+        disabled={props.disabled}
+        className="relative shrink-0 rounded p-1.5 text-slate-500 after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] hover:bg-slate-200 hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-white"
+        onClick={props.onClick}
+        {...getReferenceProps()}
+      >
+        <svg className='h-[18px] w-[18px]' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' aria-hidden='true'>
+          <path strokeLinecap='round' strokeLinejoin='round' d='M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z' />
+        </svg>
+      </button>
+      {isTooltipOpen && (
+        <FloatingPortal>
+          <span
+            // Floating UI requires this callback ref to position the tooltip.
+            // eslint-disable-next-line react-hooks/refs
+            ref={refs.setFloating}
+            style={floatingStyles}
+            className='z-30 whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-xs font-medium text-white shadow-lg dark:bg-slate-100 dark:text-slate-900'
+            {...getFloatingProps({ role: "tooltip" })}
+          >
+            <FloatingArrow
+              ref={arrowRef}
+              context={context}
+              className='fill-slate-900 dark:fill-slate-100'
+            />
+            Rename speaker
+          </span>
+        </FloatingPortal>
+      )}
+    </>
+  );
 }
 
 const TranscriptSegment = memo(function TranscriptSegment({
   chunk,
+  speakers,
   index,
   isActive,
   isEditing,
@@ -424,6 +553,9 @@ const TranscriptSegment = memo(function TranscriptSegment({
   onContainerMount,
   onTimestampHover,
   highlightRanges,
+  isSpeakerDiarizationBusy,
+  onAddSpeaker,
+  onRequestSpeakerRename,
 }: TranscriptSegmentProps) {
   const sanitizedText = useMemo(
     () => sanitizeHTML(chunk.text).trimStart(),
@@ -436,6 +568,16 @@ const TranscriptSegment = memo(function TranscriptSegment({
         .some((line) => line.length > MAX_LINE_CHARACTERS),
     [sanitizedText],
   );
+  const assignedSpeakers = (chunk.speakerIds ?? [])
+    .map((speakerId) => speakers?.find((speaker) => speaker.id === speakerId))
+    .filter((speaker): speaker is Speaker => Boolean(speaker));
+  const speakerLabel = assignedSpeakers.length
+    ? assignedSpeakers.map((speaker) => speaker.name).join(" + ")
+    : "Unassigned";
+  const selectedSpeakerId = chunk.speakerIds?.length === 1
+    ? chunk.speakerIds[0]
+    : "";
+  const hasSpeakers = Boolean(speakers?.length);
 
   return (
     <div
@@ -465,52 +607,109 @@ const TranscriptSegment = memo(function TranscriptSegment({
         </div>
       )}
       <div
-        className={`flex w-full min-w-0 ${isEditing ? "items-stretch" : "items-start"}`}
+        className={`flex w-full min-w-0 ${hasSpeakers ? "flex-wrap sm:flex-nowrap" : ""} ${isEditing ? "items-stretch" : "items-start"}`}
       >
         {isEditing ? (
-          <>
-            <EditableTimestamp
-              timestamp={chunk.timestamp[0]}
-              label={`Start time ${index + 1}`}
-              onTimestampChange={(newTimestamp) => {
-                onChunkUpdate?.(index, {
-                  ...chunk,
-                  timestamp: [newTimestamp, chunk.timestamp[1]],
-                });
-              }}
-            />
-            <EditableChunk
-              text={chunk.text.trimStart()}
-              label={`Text ${index + 1}`}
-              lang={lang}
-              dir={dir}
-              onTextChange={(text) =>
-                onChunkUpdate?.(index, { ...chunk, text })
-              }
-              onSplit={(before, after, beforeWordCount) =>
-                onSplitSegment?.(index, before, after, beforeWordCount)
-              }
-              onDeleteEmpty={() => onDeleteSegment?.(index)}
-              shouldFocus={shouldFocusEditor}
-              focusAtEnd={focusEditorAtEnd}
-              highlightRanges={highlightRanges}
-            />
-          </>
+          <EditableTimestamp
+            timestamp={chunk.timestamp[0]}
+            label={`Start time ${index + 1}`}
+            onTimestampChange={(newTimestamp) => {
+              onChunkUpdate?.(index, {
+                ...chunk,
+                timestamp: [newTimestamp, chunk.timestamp[1]],
+              });
+            }}
+          />
         ) : (
-          <>
-            <TimestampButton
-              onMount={(element) => onButtonMount(element, index)}
-              timestamp={chunk.timestamp[0]}
-              onClick={() => onSeekTo?.(chunk.timestamp[0])}
-              onKeyDown={(e) => onKeyDown(e, index)}
-              tabIndex={tabIndex}
-              onHover={onTimestampHover}
-            />
-            <div
-              className='flex-1 whitespace-pre-wrap'
-              dangerouslySetInnerHTML={{ __html: sanitizedText }}
-            />
-          </>
+          <TimestampButton
+            onMount={(element) => onButtonMount(element, index)}
+            timestamp={chunk.timestamp[0]}
+            onClick={() => onSeekTo?.(chunk.timestamp[0])}
+            onKeyDown={(e) => onKeyDown(e, index)}
+            tabIndex={tabIndex}
+            onHover={onTimestampHover}
+          />
+        )}
+        {hasSpeakers && (
+          <div className='flex min-w-24 flex-1 items-start gap-1 font-semibold text-slate-600 dark:text-slate-300 sm:me-4 sm:min-w-32 sm:flex-none'>
+            {isEditing ? (
+              <>
+                <label className='sr-only' htmlFor={`speaker-${chunk.id ?? index}`}>
+                  Speaker for segment {index + 1}
+                </label>
+                <select
+                  id={`speaker-${chunk.id ?? index}`}
+                  value={selectedSpeakerId}
+                  onChange={(event) => {
+                    if (isSpeakerDiarizationBusy) return;
+                    if (event.target.value === "__add") {
+                      const speaker = onAddSpeaker?.();
+                      if (speaker) {
+                        onChunkUpdate?.(index, {
+                          ...chunk,
+                          speakerIds: [speaker.id],
+                          speakerSource: "manual",
+                        });
+                      }
+                      return;
+                    }
+                    onChunkUpdate?.(index, {
+                      ...chunk,
+                      speakerIds: event.target.value ? [event.target.value] : [],
+                      speakerSource: "manual",
+                    });
+                  }}
+                  disabled={isSpeakerDiarizationBusy}
+                  className='w-auto max-w-full flex-none rounded-md border border-dashed border-blue-300 bg-blue-50/60 py-1 ps-2 pe-7 text-sm text-slate-800 [field-sizing:content] focus:border-solid focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-blue-400/50 dark:bg-blue-950/30 dark:text-slate-100'
+                >
+                  <option value=''>
+                    {(chunk.speakerIds?.length ?? 0) > 1 ? speakerLabel : "Unassigned"}
+                  </option>
+                  {speakers?.map((speaker) => (
+                    <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                  ))}
+                  <option value='__add'>Add speaker...</option>
+                </select>
+                {selectedSpeakerId && (
+                  <RenameSpeakerButton
+                    speakerLabel={speakerLabel}
+                    disabled={isSpeakerDiarizationBusy}
+                    onClick={() => {
+                      if (isSpeakerDiarizationBusy) return;
+                      const speaker = assignedSpeakers[0];
+                      if (speaker) onRequestSpeakerRename?.(speaker);
+                    }}
+                  />
+                )}
+              </>
+            ) : (
+              <span className='truncate px-2 py-0.5 leading-normal'>{speakerLabel}</span>
+            )}
+          </div>
+        )}
+        {isEditing ? (
+          <EditableChunk
+            className={hasSpeakers ? "mt-2 basis-full sm:mt-0 sm:basis-auto" : undefined}
+            text={chunk.text.trimStart()}
+            label={`Text ${index + 1}`}
+            lang={lang}
+            dir={dir}
+            onTextChange={(text) =>
+              onChunkUpdate?.(index, { ...chunk, text })
+            }
+            onSplit={(before, after, beforeWordCount) =>
+              onSplitSegment?.(index, before, after, beforeWordCount)
+            }
+            onDeleteEmpty={() => onDeleteSegment?.(index)}
+            shouldFocus={shouldFocusEditor}
+            focusAtEnd={focusEditorAtEnd}
+            highlightRanges={highlightRanges}
+          />
+        ) : (
+          <div
+            className={`min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere] ${hasSpeakers ? "mt-2 basis-full sm:mt-0 sm:basis-auto" : ""}`}
+            dangerouslySetInnerHTML={{ __html: sanitizedText }}
+          />
         )}
       </div>
     </div>
@@ -918,6 +1117,11 @@ const Transcript = memo(function Transcript({
   summary,
   onGenerateSummary,
   supportsSummarizer,
+  diarization,
+  audioAvailable,
+  onIdentifySpeakers,
+  onAddSpeaker,
+  onRenameSpeaker,
   currentTime,
   subscribeToTimeUpdate,
   isAutoScrollSettingEnabled = true,
@@ -944,6 +1148,49 @@ const Transcript = memo(function Transcript({
   const [findReplaceMode, setFindReplaceMode] = useState<"find" | "replace">(
     "find",
   );
+  const [speakerCountModalOpen, setSpeakerCountModalOpen] = useState(false);
+  const [speakerCount, setSpeakerCount] = useState<SpeakerCountMode>("auto");
+  const [customSpeakerCount, setCustomSpeakerCount] = useState("2");
+  const parsedCustomSpeakerCount = Number(customSpeakerCount);
+  const customSpeakerCountValid =
+    Number.isInteger(parsedCustomSpeakerCount) &&
+    parsedCustomSpeakerCount >= 2 &&
+    parsedCustomSpeakerCount <= 9;
+  const customSpeakerCountSelected =
+    typeof speakerCount === "number";
+  const speakerCountValid =
+    !customSpeakerCountSelected || customSpeakerCountValid;
+  const hasCompletedDiarization = Boolean(
+    diarization &&
+    !diarization.isBusy &&
+    diarization.progress >= 100 &&
+    !diarization.error,
+  );
+  const showIdentifySpeakers = Boolean(
+    audioAvailable &&
+    !hasCompletedDiarization,
+  );
+  const [speakerRename, setSpeakerRename] = useState<
+    { id: string; originalName: string; name: string } | undefined
+  >(undefined);
+  const requestSpeakerRename = useCallback((speaker: Speaker) => {
+    if (diarization?.isBusy) return;
+    setSpeakerRename({
+      id: speaker.id,
+      originalName: speaker.name,
+      name: speaker.name,
+    });
+  }, [diarization?.isBusy]);
+  const submitSpeakerRename = useCallback(() => {
+    if (diarization?.isBusy) return;
+    const name = speakerRename?.name.trim();
+    if (!speakerRename || !name) return;
+    onRenameSpeaker?.(speakerRename.id, name);
+    setSpeakerRename(undefined);
+  }, [diarization?.isBusy, onRenameSpeaker, speakerRename]);
+  useEffect(() => {
+    if (diarization?.isBusy) setSpeakerRename(undefined);
+  }, [diarization?.isBusy]);
   const [findQuery, setFindQuery] = useState("");
   const [replaceValue, setReplaceValue] = useState("");
   const [matchCase, setMatchCase] = useState(false);
@@ -1207,11 +1454,38 @@ const Transcript = memo(function Transcript({
   const extractSentenceText = (html: string): string =>
     extractPlainText(html).replace(/\s*\n+\s*/g, " ").trim();
 
-  const exportTXT = () => {
-    const text = chunks
-      .map((chunk) => extractSentenceText(chunk.text))
-      .join(" ")
+  const getSpeakerLabel = (chunk: TranscriptChunk): string | undefined => {
+    const names = chunk.speakerIds
+      ?.map((speakerId) => diarization?.speakers.find(
+        (speaker) => speaker.id === speakerId,
+      )?.name)
+      .filter((name): name is string => Boolean(name));
+    return names?.length ? names.join(" + ") : undefined;
+  };
+
+  const formatTextWithSpeakerLabels = () => {
+    const lines: { speaker?: string; text: string }[] = [];
+    for (const chunk of chunks) {
+      const text = extractSentenceText(chunk.text);
+      if (!text) continue;
+
+      const speaker = getSpeakerLabel(chunk);
+      const previous = lines[lines.length - 1];
+      if (previous?.speaker === speaker) {
+        previous.text += ` ${text}`;
+      } else {
+        lines.push({ speaker, text });
+      }
+    }
+
+    return lines
+      .map((line) => line.speaker ? `${line.speaker}: ${line.text}` : line.text)
+      .join("\n\n")
       .trim();
+  };
+
+  const exportTXT = () => {
+    const text = formatTextWithSpeakerLabels();
 
     const slug = mediaTitle && slugifyTitle(mediaTitle);
     const blob = new Blob([text], { type: "text/plain" });
@@ -1256,10 +1530,7 @@ saveBlob(blob, "transcript.json");
   }, [copiedState]);
 
   const copyToClipboard = async () => {
-    let text = chunks
-      .map((chunk) => extractSentenceText(chunk.text))
-      .join(" ")
-      .trim();
+    let text = formatTextWithSpeakerLabels();
 
     // Use regex to add double line breaks around any [bracketed] text
     // and absorb surrounding spaces so lines start cleanly
@@ -1780,6 +2051,7 @@ saveBlob(blob, "transcript.json");
                 <TranscriptSegment
                   key={`segment-${chunk.timestamp[0]}-${chunk.timestamp[1]}-${chunk.text}`}
                   chunk={chunk}
+                  speakers={hasCompletedDiarization ? diarization?.speakers : undefined}
                   index={i}
                   isActive={i === activeIndex}
                   isEditing={Boolean(isEditing)}
@@ -1797,6 +2069,9 @@ saveBlob(blob, "transcript.json");
                   onContainerMount={handleContainerRef}
                   onTimestampHover={setTooltipTarget}
                   highlightRanges={highlightRangesByChunk.get(i)}
+                  isSpeakerDiarizationBusy={Boolean(diarization?.isBusy)}
+                  onAddSpeaker={onAddSpeaker}
+                  onRequestSpeakerRename={requestSpeakerRename}
                 />
               ))}
             </div>
@@ -1894,9 +2169,39 @@ saveBlob(blob, "transcript.json");
             ))}
           </div>
 
-          {
-            supportsSummarizer && !summary?.summary && (
-              <div className='w-full mt-2 flex flex-wrap items-center justify-center'>
+          {(showIdentifySpeakers || (supportsSummarizer && !summary?.summary)) && (
+            <div className='w-full mt-3 flex flex-wrap items-center justify-center gap-3'>
+              {showIdentifySpeakers && (
+                <button
+                  type='button'
+                  onClick={() => setSpeakerCountModalOpen(true)}
+                  disabled={diarization?.isBusy || isEditing}
+                  className='export-button gap-1.5'
+                >
+                  {diarization?.isBusy ? (
+                    <Spinner text={`Identifying speakers... ${Math.round(diarization.progress)}%`} />
+                  ) : (
+                    <>
+                      <svg
+                        className='h-5 w-5'
+                        viewBox='0 0 24 24'
+                        fill='none'
+                        stroke='currentColor'
+                        strokeWidth='2'
+                        strokeLinecap='round'
+                        strokeLinejoin='round'
+                        aria-hidden='true'
+                      >
+                        <path d='M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2' />
+                        <circle cx='9' cy='7' r='4' />
+                        <path d='M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' />
+                      </svg>
+                      Identify speakers
+                    </>
+                  )}
+                </button>
+              )}
+              {supportsSummarizer && !summary?.summary && (
                 <button
                   type='button'
                   onClick={onGenerateSummary}
@@ -1920,9 +2225,15 @@ saveBlob(blob, "transcript.json");
                     </>
                   )}
                 </button>
-              </div>
-            )
-          }
+              )}
+            </div>
+          )}
+
+          {diarization?.error && (
+            <p className='mt-2 text-sm text-red-700 dark:text-red-300' role='alert'>
+              {diarization.error}
+            </p>
+          )}
 
           {
             summary?.summary && (
@@ -1938,14 +2249,169 @@ saveBlob(blob, "transcript.json");
                 >
                   Summary
                 </h2>
-                <p className='whitespace-pre-wrap text-slate-700 dark:text-slate-300'>
-                  {summary.summary}
+                <p
+                  lang='en'
+                  dir='ltr'
+                  className='mt-1 mb-3 flex items-center gap-1.5 text-sm font-medium text-amber-700 dark:text-amber-400'
+                >
+                  <WarningIcon className='h-4 w-4 shrink-0' />
+                  AI makes mistakes. Review for accuracy.
                 </p>
+                {summary.type === "key-points" ? (
+                  parseKeyPointBlocks(summary.summary).map((block, i) =>
+                    block.bullets.length > 0 ? (
+                      <ul
+                        key={i}
+                        className='list-disc pl-5 text-slate-700 dark:text-slate-300 space-y-1.5'
+                      >
+                        {block.bullets.map((bullet, j) => (
+                          <li key={j}>{renderWithSpeakerPrefix(bullet)}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p
+                        key={i}
+                        className='whitespace-pre-wrap text-slate-700 dark:text-slate-300'
+                      >
+                        {block.text}
+                      </p>
+                    ),
+                  )
+                ) : (
+                  <p className='whitespace-pre-wrap text-slate-700 dark:text-slate-300'>
+                    {summary.summary}
+                  </p>
+                )}
               </div>
             )
           }
         </>
       )}
+
+      <Modal
+        show={speakerCountModalOpen}
+        onClose={() => setSpeakerCountModalOpen(false)}
+        onSubmit={() => {
+          setSpeakerCountModalOpen(false);
+          onIdentifySpeakers?.(speakerCount);
+        }}
+        title='Identify speakers'
+        submitText='Identify speakers'
+        cancelText='Cancel'
+        submitEnabled={speakerCountValid}
+        content={
+          <div className='identify-speakers-dialog'>
+            <p className='identify-speakers-dialog__description'>
+              Speaker detection performs best for small-to-medium group discussions with clear audio. To <strong>improve accuracy,</strong> manually set the expected number of participants.
+            </p>
+            <button
+              type='button'
+              aria-pressed={speakerCount === "auto"}
+              onClick={() => setSpeakerCount("auto")}
+              className={`identify-speakers-option ${speakerCount === "auto"
+                ? "identify-speakers-option--selected"
+                : ""
+                }`}
+            >
+              <span>Auto-detect</span>
+              {speakerCount === "auto" && (
+                <svg className='identify-speakers-option__check' viewBox='0 0 20 20' fill='currentColor' aria-hidden='true'>
+                  <path fillRule='evenodd' d='M16.704 5.29a1 1 0 0 1 .006 1.414l-7.25 7.31a1 1 0 0 1-1.42.006L3.29 9.362a1 1 0 1 1 1.42-1.408l4.04 4.073 6.54-6.598a1 1 0 0 1 1.414-.138Z' clipRule='evenodd' />
+                </svg>
+              )}
+            </button>
+            <div className={`identify-speakers-option identify-speakers-option--custom ${customSpeakerCountSelected
+              ? "identify-speakers-option--selected"
+              : ""
+              }`}>
+              <div className='identify-speakers-option__content'>
+                <label
+                  htmlFor='speaker-count-input'
+                  className='identify-speakers-option__label'
+                >
+                  Number of speakers
+                  {customSpeakerCountSelected && (
+                    <svg className='identify-speakers-option__check' viewBox='0 0 20 20' fill='currentColor' aria-hidden='true'>
+                      <path fillRule='evenodd' d='M16.704 5.29a1 1 0 0 1 .006 1.414l-7.25 7.31a1 1 0 0 1-1.42.006L3.29 9.362a1 1 0 1 1 1.42-1.408l4.04 4.073 6.54-6.598a1 1 0 0 1 1.414-.138Z' clipRule='evenodd' />
+                    </svg>
+                  )}
+                </label>
+                <p id='custom-speaker-count-help' className='identify-speakers-option__help'>
+                  Enter a number between 2 and 9.
+                </p>
+              </div>
+              <div className='identify-speakers-option__input-container'>
+                <input
+                  id='speaker-count-input'
+                  type='number'
+                  min='2'
+                  max='9'
+                  inputMode='numeric'
+                  aria-label='Custom number of speakers'
+                  aria-invalid={customSpeakerCountSelected && !customSpeakerCountValid}
+                  aria-describedby='custom-speaker-count-help'
+                  value={customSpeakerCount}
+                  onFocus={() => setSpeakerCount(
+                    customSpeakerCountValid
+                      ? parsedCustomSpeakerCount as SpeakerCountMode
+                      : 2,
+                  )}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setCustomSpeakerCount(value);
+                    const parsed = Number(value);
+                    if (Number.isInteger(parsed) && parsed >= 2 && parsed <= 9) {
+                      setSpeakerCount(parsed as SpeakerCountMode);
+                    }
+                  }}
+                  className='identify-speakers-option__input'
+                />
+              </div>
+            </div>
+          </div>
+        }
+      />
+
+      <Modal
+        show={Boolean(speakerRename)}
+        onClose={() => setSpeakerRename(undefined)}
+        onSubmit={submitSpeakerRename}
+        title='Rename speaker'
+        submitText='Rename speaker'
+        cancelText='Cancel'
+        submitEnabled={Boolean(speakerRename?.name.trim())}
+        content={
+          <div>
+            <label
+              htmlFor='speaker-name'
+              className='form-label'
+            >
+              Speaker name
+            </label>
+            {speakerRename && (
+              <p className='text-sm text-slate-500 dark:text-slate-400 mb-2'>
+                Renaming <em>{speakerRename.originalName}</em> updates every assigned segment.
+              </p>
+            )}
+            <input
+              id='speaker-name'
+              type='text'
+              autoFocus
+              value={speakerRename?.name ?? ""}
+              onChange={(event) => setSpeakerRename((current) => current
+                ? { ...current, name: event.target.value }
+                : current)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && speakerRename?.name.trim()) {
+                  event.preventDefault();
+                  submitSpeakerRename();
+                }
+              }}
+              className='url-input'
+            />
+          </div>
+        }
+      />
 
       {/*transcribedData?.isBusy && transcribedData?.tps && (
         <div className='status-row'>
